@@ -1,0 +1,15 @@
+{
+    "name": "User_1",
+    "username": "user1",
+    "likes": [
+        "I want to know what are dogs.",
+        "What is a healthy and nutritious diet for a dog?",
+        "What is a good diet for dogs?",
+        "What should we include in a dogs care?",
+        "I would like to know about dog supplies.",
+        "How can a dog help human beings?"
+    ],
+    "dislikes": [
+        "Can you tell me something about guide dogs for the blind."
+    ]
+}
