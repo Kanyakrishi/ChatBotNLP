@@ -1,198 +1,333 @@
-from collections import deque
 import os
-from urllib.parse import urljoin
-from bs4 import BeautifulSoup
-from nltk.stem import WordNetLemmatizer
-import numpy as np
+import json
 import requests
+import requests
+
+from bs4 import BeautifulSoup
+from collections import Counter
+from gensim import corpora, models
+from googlesearch import search 
 from sklearn.feature_extraction.text import TfidfVectorizer
-import pickle
-from utils import  preprocess_text
+from sklearn.metrics.pairwise import cosine_similarity
+from search_engine_parser.core.exceptions import NoResultsOrTrafficError
 
-wnl = WordNetLemmatizer()
+from utils import clean_text_lda, preprocess_text, handle_unknown_query, get_greeting, dog_facts, farewells, acknowledgments, sia, get_user_input, nlp, initial_message
+
+user_model = None
+username = None
+liked_terms = []
+
+def load_lda_model(model_path="lda_model.model"):
+    if os.path.exists(model_path):
+        return models.LdaModel.load(model_path)
+    else:
+        print(f"Error: LDA model not found at {model_path}")
+        return None
+
+lda_model = load_lda_model()
+dictionary = corpora.Dictionary.load('dog_lda_dict.gensim')
 
 
-def crawl_and_save(start_urls, max_urls=25):
-    if not os.path.exists('webpages_crawled'):
-        os.makedirs('webpages_crawled')
-    
-    crawled_urls = set()  # crawled URLs to avoid repetition
-    urls_queue = deque(start_urls)  # Queue for BFS
-    
-    while urls_queue and len(crawled_urls) < max_urls:
-        current_url = urls_queue.popleft()  # Pop from the queue
-        if current_url in crawled_urls:
-            continue  # Skip ifalready been crawled
+# ----------------- FILTER REPSOSNE BASED ON LIKES  ------------------------
+def get_match_based_on_user(all_matches, best_match):
+  if len(liked_terms) > 0:
+    if best_match and any(term in best_match[1].lower() for term in liked_terms):
+        return best_match
+      
+    for match in all_matches:
+        if any(term in match[1].lower() for term in liked_terms):
+            return match
+
+  return best_match
+  
+def extract_important_terms(likes_list):
+    combined_text = ' '.join(likes_list)
+    terms = clean_text_lda(combined_text)
+    term_frequencies = Counter(terms)
+    return [term for term, freq in term_frequencies.items() if freq > 1]
+  
+# ----------------- COSINE SIMILARITY ------------------------
+def get_cosine_similarity(user_query):
+  max_similarity = 0.35
+  best_match = None
+  all_matches = set()
+  for topic, facts in dog_facts.items():
+      for fact in facts:
+          similarity = calculate_similarity(user_query, fact)
+          if similarity >= max_similarity:
+              max_similarity = similarity
+              best_match = (topic, fact)
+              all_matches.add((topic, fact))
+  return get_match_based_on_user(all_matches, best_match)
+
+
+def calculate_similarity(user_query, doc):
+    # Preprocess both user query and document text
+    user_query_processed = preprocess_text(user_query)
+    doc_processed = preprocess_text(doc)
+
+    # Create a TF-IDF Vectorizer and convert texts into TF-IDF vectors
+    vectorizer = TfidfVectorizer()
+    combined_texts = [user_query_processed, doc_processed]
+    tfidf_vectors = vectorizer.fit_transform(combined_texts)
+
+    # Calculate cosine similarity score between the vectors
+    similarity_scores = cosine_similarity(tfidf_vectors[0:1], tfidf_vectors[1:2])
+    return similarity_scores[0][0]
+
+# ----------------- LESK and NER  ------------------------
+def get_lesk_similarity(user_query):
+  '''
+  This method would obtain all the entitiies from the user query using NER. 
+  It then performs the same on the knowledge base and finds a match.
+  '''
+  user_query_processed = preprocess_text(user_query)
+  user_query_doc = nlp(user_query_processed)
+  user_query_entities = set(ent.text for ent in user_query_doc.ents)
+  
+  candidate_facts = []
+  for topic, facts in dog_facts.items():
+    for fact in facts:
+        fact_doc = nlp(fact)
+        fact_entities = set(ent.text for ent in fact_doc.ents)
+        if user_query_entities.intersection(fact_entities):
+            candidate_facts.append((topic, fact))
+  
+  # best_lesk_fact = max(lesk_scores, key=lesk_scores.get, default=None)
+  if len(candidate_facts) == 0: 
+    return None
+  # return candidate_facts
+  if candidate_facts: return get_match_based_on_user(candidate_facts, candidate_facts[0])
+
+# ----------------- POS TAGGING  ------------------------
+def get_nouns_from_pos(text):
+  doc = nlp(text)
+  nouns = [token.text for token in doc if token.pos_ == "NOUN"]
+  return nouns
+
+def find_most_similar_pos_tagging(user_query):
+  threshold = 2
+  user_nouns = get_nouns_from_pos(user_query)
+  candidate_facts = []
+  for topic, facts in dog_facts.items():
+    for fact in facts:
+      fact_nouns = get_nouns_from_pos(fact)
+      overlap = len(set(user_nouns).intersection(set(fact_nouns)))
+      if overlap >= threshold:
+        candidate_facts.append((topic, fact, overlap))
+
+  # Rank facts based on noun overlap (you can add other similarity measures)
+  ranked_facts = sorted(candidate_facts, key=lambda x: x[2], reverse=True)
+  if ranked_facts: return get_match_based_on_user(ranked_facts, ranked_facts[0])
+  return None
+
+# ----------------- DEPENDENCY GRAPH  ------------------------
+def get_entities_and_relations_from_dependency_parsing(text):
+    text = preprocess_text(text)
+    doc = nlp(text)
+    entities = []
+    relations = []
+    for token in doc:
+        if token.dep_ in ["nsubj", "obj", "ROOT"]:  # Focus on key entities
+            entities.append(token.text.lower())
+        if token.dep_ in ["amod", "nmod", "prep"]:  # Extract common relationships
+            relations.append(token.text.lower())
+    return entities, relations
+
+def find_most_similar_dependency_parsing(user_query):
+    threshold = 1
+    user_entities, user_relations = get_entities_and_relations_from_dependency_parsing(user_query)
+    # print("USER ENTITIES: ", user_entities, "\n")
+    candidate_facts = []
+    for topic, facts in dog_facts.items():
+        for fact in facts:
+            fact_entities, fact_relations = get_entities_and_relations_from_dependency_parsing(fact)
+            # print(fact_entities)
+            overlap_entities = len(set(user_entities).intersection(set(fact_entities)))
+            overlap_relations = len(set(user_relations).intersection(set(fact_relations)))
+            similarity_score = overlap_entities + overlap_relations
+            if similarity_score >= threshold:
+              candidate_facts.append((topic, fact, similarity_score))
+
+    # Rank facts based on entity and relation overlap
+    ranked_facts = sorted(candidate_facts, key=lambda x: x[2], reverse=True)
+    if ranked_facts: return get_match_based_on_user(ranked_facts, ranked_facts[0])
+    return None
+  
+  
+# ----------------- LDA SIMILARITY ------------------------
+def get_topics_from_text(text):
+    preprocessed_text = clean_text_lda(text)
+    bow = dictionary.doc2bow(preprocessed_text)
+    user_topics = lda_model.get_document_topics(bow)
+    sorted_topics = sorted(user_topics, key=lambda x: x[1], reverse=True)
+    return sorted_topics
+
+def find_most_similar_topic_modelling(user_query):
+    threshold = 0.6
+    user_topics = get_topics_from_text(user_query)
+    # print(user_topics)
+    # print(lda_model.show_topic(user_topics[0][0]))
+    best_match = []
+    if user_topics:  # Check if the list is not empty
+        most_relevant_topic_id = user_topics[0][0]  # Get relevant topic
+        if user_topics[0][1] >= threshold: # this is the threshold for LDA
+          topic_terms = lda_model.show_topic(most_relevant_topic_id)
+          for word, probability in topic_terms:
+            # print(word, probability)
+            for key,facts in dog_facts.items():
+              if word == key:
+                best_match = (word, dog_facts[word])
+                threshold = max(threshold, user_topics[0][1])
+        else:
+          return None
+    if best_match: return best_match[:2]
+    return None
+
+
+# ----------------- Web Lookup ------------------------
+def get_first_web_link_summary(query):
+    first_url = None
+    try:
+        urls = [link for link in search(query, num=10, stop=10, pause=2) if not any(substring in link for substring in ['https://www.youtube.com', '.jpg', '.png', '.gif', 'image', 'img'])]
         
-        try:
-            response = requests.get(current_url)
-            if response.status_code == 200:
-                soup = BeautifulSoup(response.text, 'html.parser')
-                
-                # Save the webpage content
-                safe_filename = f"{current_url.split('//')[-1].replace('/', '_').replace('?', '_')}.txt"
-                filepath = os.path.join('webpages_crawled', safe_filename)
-                with open(filepath, 'w', encoding='utf-8') as f:
-                    f.write(soup.get_text())
-                
-                crawled_urls.add(current_url)  # Mark this URL as crawled
-                
-                # Find and enqueue new URLs
-                for link in soup.find_all('a', href=True):
-                    if len(crawled_urls) >= max_urls:
-                        break  # max urls
-                    next_page = link['href']
-                    if not next_page.startswith('http'):
-                        next_page = urljoin(current_url, next_page)  
-                    if next_page not in crawled_urls and next_page not in urls_queue:
-                        urls_queue.append(next_page)  # Enqueue new URL
-            elif response.status_code in [403, 404]:
-                print(f"Access denied or not found for {current_url}")
-            else:
-                print(f"Failed to crawl {current_url} with status code: {response.status_code}")
-            
-        except Exception as e:
-            print(f"Failed to crawl {current_url}: {e}")
+        if not urls:
+            return None
         
-    # print("Crawled all URLS: ", crawled_urls)
-                
-            
-def cleaning(data_dir):
-    for filename in os.listdir(data_dir):
-        filepath = os.path.join(data_dir, filename)
-        with open(filepath, "r", encoding='utf-8') as f:
-            text = f.read()
-            cleaned_text = preprocess_text(text)
-            # Writing back 
-            with open(filepath, 'w', encoding='utf-8') as file:
-                file.write(cleaned_text)
+        first_url = urls[0]        
+
+        response = requests.get(first_url)
+        soup = BeautifulSoup(response.text, 'html.parser')
         
-def extract_top_terms(data_dir,top_n=50):
-    all_content = []
-    for filename in os.listdir(data_dir):
-        filepath = os.path.join(data_dir, filename)
-        with open(filepath, "r", encoding='utf-8') as f:
-            text = f.read()
-            all_content.append(text)
-    
-    # Calculate TF-IDF
-    vectorizer = TfidfVectorizer(max_features=1000)  
-    X = vectorizer.fit_transform(all_content)
-    
-    # Sum TF-IDF scores for each term across all documents
-    scores = np.sum(X, axis=0)
-    scores = np.squeeze(np.asarray(scores))  # Convert from matrix to array
-    
-    # Get terms and scores
-    feature_names = np.array(vectorizer.get_feature_names_out())
-    sorted_indices = np.argsort(scores)[::-1]  # Indices of terms in descending order of score
-    
-    # Extract the top N terms with the highest TF-IDF scores
-    top_terms = feature_names[sorted_indices][:top_n]
-    # print(feature_names)
-    return top_terms
+        paragraphs = soup.find_all('p')
+        summary = ' '.join([para.text for para in paragraphs[:2]]) if paragraphs else 'No text available'
         
+        return first_url, summary
+
+    except requests.exceptions.RequestException as e:
+        return first_url, "Failed to retrieve content: " + str(e)
+
+
+# ----------------- MAIN function ------------------------
+def find_most_similar(user_query):
+    # Initialize all match variables to None
+    best_match_cosine = None
+    best_match_graph = None
+    best_match_topic = None
+    best_match_pos = None
+    best_match_lesk = None
+
+    # Method 3: POS Tagging
+    best_match_pos = find_most_similar_pos_tagging(user_query)
+    if best_match_pos is not None:
+        return best_match_pos
+      
+    # METHOD 1: COSINE SIMILARITY
+    best_match_cosine = get_cosine_similarity(user_query)
+    if best_match_cosine is not None:
+        return best_match_cosine
+
+    # Method 2: LDA Topic modelling
+    best_match_topic = find_most_similar_topic_modelling(user_query)
+    if best_match_topic is not None:
+        return best_match_topic
+
+    # Method 4: Dependency graphs, make sure the graph score is not 0
+    best_match_graph = find_most_similar_dependency_parsing(user_query)
+    if best_match_graph is not None:
+        return best_match_graph
+
+    # METHOD 5: Using NER to get the entities. Sometimes the user query might be NULL
+    best_match_lesk = get_lesk_similarity(user_query)
+    if best_match_lesk is not None:
+        return best_match_lesk
+      
+    return None
+
+# ----------------- USER MODEL ------------------------
+def get_or_create_user_model(username):
+    directory = "user_models"
+    file_path = os.path.join(directory, f"{username}.json")
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+    if os.path.isfile(file_path):
+        with open(file_path, "r", encoding="utf-8") as file:
+            user_model = json.load(file)
+            print(f"Welcome back {user_model.get('name', 'there')}!")  # Welcome back message
+            return user_model
+    else:
+        name = input("I see it's your first time here. What's your name? ")
+        return {"name": name, "username": username, "likes": [], "dislikes": []}
+
+def save_user_model(user_model):
+    directory = "user_models"
+    file_path = os.path.join(directory, f"{user_model['username']}.json")
+    with open(file_path, "w", encoding="utf-8") as file:
+        json.dump(user_model, file, ensure_ascii=False, indent=4)
+
+def add_to_user_preferences(user_model, message):
+    sentiment_score = sia.polarity_scores(message)
+    if sentiment_score['compound'] > 0.05:  # Positive sentiment
+        user_model['likes'].append(message)
+    elif sentiment_score['compound'] < -0.05:  # Negative sentiment
+        user_model['dislikes'].append(message)
+    
+
+def main():
+    print(initial_message)
+    username = input("Enter your username to start: ")
+    user_model = get_or_create_user_model(username.lower())  # Convert username to lowercase for consistency
+    liked_terms = extract_important_terms(user_model['likes'])
+    print(get_greeting())
+
+    while True:
+        user_input = get_user_input()
+        if len(user_input) < 1:
+          print("Please enter a valid question or statement.")
+          break
+        add_to_user_preferences(user_model, user_input)  
+        if user_input.lower() == "quit": break
         
-start_urls = ["https://www.purina.co.uk/articles/dogs/behaviour/common-questions/amazing-dog-facts"]
+        if user_input.lower() in acknowledgments:
+            response = "Hope you were satisfied with my answer."
+            print(response)
+            print("We can continue further. Ask me anything about Dogs.")
+            continue
 
-# Part 1a & 1b Crawling URL, upto 25 urls. Saving the content to a file
-crawl_and_save(start_urls)
+        if user_input.lower() in farewells:
+            response = "Hope you were satisfied with my answers. Goodbye!"
+            print(response)
+            break
 
-# Part 1c Cleaning texts using NLP techniques 
-cleaning('webpages_crawled')
+        response = find_most_similar(user_input)
+        if response is not None and len(response) >= 2:
+            print(f"Here's what I found about the topic '{response[0]}': {response[1]}")
+        else:
+            # Method 6: Optional live web lookup
+            print("Live web lookup is happening... hang in there!")
+            try:
+              web_lookup_result = get_first_web_link_summary(user_input)
+              if web_lookup_result is not None:
+                  url, summary = web_lookup_result
+                  print(f"I found something on the web that might help: {url} - Here's a summary: {summary}")
+            except NoResultsOrTrafficError:
+                print("Search failed due to no results or unusual traffic. Please try again later.")
+            print("\n")
+            print(handle_unknown_query())
 
-# Part 1d  function to extract at least 25 important terms f
-important_terms = extract_top_terms('webpages_crawled')
-print("\nTOP TERMS: ", important_terms)
+        save_user_model(user_model)
 
-# 1e knowledge base information
-dog_knowledge_base = {
-    "breed": [
-        "Dog breeds are distinctly varied and were originally bred for specific roles such as hunting, guarding, or companionship.",
-        "The American Kennel Club recognizes over 190 dog breeds."
-    ],
-    "purina": [
-        "Purina is a pet food brand that offers a wide range of products for dogs, including dry kibble, wet food, and treats.",
-        "Purina conducts extensive pet nutrition research and operates the Purina PetCare Center for diet and feeding studies."
-    ],
-    "article": [
-        "Articles about dogs can cover a range of topics including health, nutrition, training, and breed information.",
-        "Reading articles from reputable sources can help dog owners make informed decisions about their pet's care."
-    ],
-    "name": [
-        "Choosing a name for a dog can be based on its personality, appearance, or breed traits.",
-        "Popular dog names include Max, Bella, Charlie, and Luna."
-    ],
-    "advice": [
-        "Professional advice from veterinarians and dog trainers can be crucial for addressing health and behavior issues.",
-        "Seeking advice from credible sources is important for the well-being of dogs."
-    ],
-    "product": [
-        "Dog products range from food and treats to toys, beds, and grooming supplies.",
-        "Choosing the right products for a dog's size, age, and health can improve their quality of life."
-    ],
-    "brand": [
-        "There are numerous brands in the pet industry, each offering different types of products and food for dogs.",
-        "Well-known dog food brands include Royal Canin, Purina, and Hill's Science Diet."
-    ],
-    "guide": [
-        "Guides can provide step-by-step instructions on dog care, training, and nutrition.",
-        "Puppy guides are especially helpful for first-time dog owners."
-    ],
-    "newsletter": [
-        "Many dog-related websites and organizations offer newsletters that provide updates, advice, and stories about dogs.",
-        "Subscribing to a dog-related newsletter can be a great way to stay informed about new research and tips for dog care."
-    ],
-    "senior": [
-        "Senior dogs often require different care compared to younger dogs, including special diets and more frequent health check-ups.",
-        "Age-related changes in senior dogs can include reduced mobility, hearing loss, and vision impairment."
-    ],
-    "puppy": [
-        "Puppies require a lot of time, patience, and training during their first few months.",
-        "Proper nutrition, socialization, and veterinary care are crucial for a puppy's development."
-    ],
-    "feeding": [
-        "Feeding practices for dogs vary based on their age, breed, and health status.",
-        "It's important to measure a dog's food and follow feeding guidelines to prevent obesity."
-    ],
-    "finding": [
-        "Finding the right dog involves considering lifestyle, housing, and family members' needs and preferences.",
-        "Adoption from shelters or rescues is a responsible way to find a new dog while providing a home to a pet in need."
-    ],
-    "owner": [
-        "Dog owners are responsible for their pet’s health, safety, and well-being.",
-        "Being a responsible owner includes providing regular veterinary care, proper nutrition, and adequate exercise."
-    ],
-    "adult": [
-        "Adult dogs typically require less intensive care than puppies but still need regular exercise, health check-ups, and balanced nutrition.",
-        "The transition from puppy to adult food should be gradual to avoid digestive issues."
-    ],
-    "topic": [
-        "Topics related to dogs can range from training methods to health issues and breed-specific information.",
-        "Engaging with various topics can help owners provide a better life for their dogs."
-    ],
-    "kitten": [
-        "While primarily associated with cats, raising kittens and puppies together can lead to harmonious relationships if properly introduced.",
-        "Kittens and puppies can learn to coexist peacefully with proper supervision and socialization."
-    ],
-    "treat": [
-        "Dog treats can be used as a part of training to reinforce positive behavior.",
-        "It's important to choose treats that are suitable for the dog’s size and dietary needs."
-    ],
-    "black": [
-        "Black dogs are as diverse in breed and personality as dogs of any other color.",
-        "Black Dog Syndrome is a phenomenon where black dogs are often the last to be adopted from shelters."
-    ],
-    "contact": [
-        "In case of emergency, dog owners should have contact information for their veterinarian readily available.",
-        "Microchipping dogs and having a collar with contact information can help if the dog gets lost."
-    ],
-    "type": [
-        "Dogs come in various types including companion dogs, working dogs, and sporting dogs."]
-}
 
-# 1f Pickle the knowledge base for future use
-with open("dog_facts.pickle", "wb") as f:
-    pickle.dump(dog_knowledge_base, f)
+if __name__ == "__main__":
+  main()
+  
 
+
+# LESK and NER 
+
+
+# if not ner entities (SPacy)
+#     within that lesk with potential topic 
+# then dependency parsing 
+# if not then POS (noun)
 
