@@ -1,0 +1,8 @@
+The required packages for installation are:
+
+nltk, spacy, gensim, beautifulsoup4, numpy, requests, scikit-learn, googlesearch-python, search-engine-parser
+
+1. utils.py - This file contains common methods such as cleaning text, stop_words, handing unknow queires etc.
+2. web_crawler.py - This file contains the code for web crawling. The pages will be stored under webpages_crawled.
+3. LDA_model_creation.py - This file will create the LDA model based on the knowledge base. 
+4. chatbot.py - This file is the main file for running the chatbot. 
