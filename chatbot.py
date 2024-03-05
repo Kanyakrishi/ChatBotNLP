@@ -286,7 +286,9 @@ def main():
           print("Please enter a valid question or statement.")
           break
         add_to_user_preferences(user_model, user_input)  
-        if user_input.lower() == "quit": break
+        if user_input.lower() == "quit": 
+            save_user_model(user_model)
+            break
         
         if user_input.lower() in acknowledgments:
             response = "Hope you were satisfied with my answer."
